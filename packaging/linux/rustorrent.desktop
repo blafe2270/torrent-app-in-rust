@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rustorrent
+Comment=Fast, simple BitTorrent client
+Exec=rustorrent %U
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;
