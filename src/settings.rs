@@ -8,21 +8,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::upload_policy::WhileDownloading;
+use crate::upload_policy::{self, WhileDownloading};
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub download_dir: PathBuf,
-    /// Global download limit in KiB/s. 0 = unlimited.
+    /// Global download limit in KB/s (1000 bytes). 0 = unlimited.
     pub download_limit_kib: u32,
-    /// Global upload limit in KiB/s. 0 = unlimited.
+    /// Global upload limit in KB/s (1000 bytes). 0 = unlimited.
     pub upload_limit_kib: u32,
-    /// Throttle upload while anything is still downloading, so a saturated
-    /// upstream doesn't slow downloads.
-    pub throttle_upload_while_downloading: bool,
-    /// Upload cap (KiB/s) while downloading. 0 = automatic.
-    pub upload_while_downloading_kib: u32,
+    /// The connection's upload capacity in Mbit/s (0 = not set). While
+    /// downloading, upload is kept to 80% of it so the link never saturates.
+    pub upload_capacity_mbps: f32,
     /// Maximum connected peers per torrent.
     pub max_peers_per_torrent: usize,
     /// TCP/uTP port for incoming peer connections.
@@ -33,6 +31,8 @@ pub struct Settings {
     pub enable_upnp: bool,
     /// Add well-known public trackers to every non-private torrent.
     pub extra_trackers: bool,
+    /// Show torrents as an icon grid (true) or a detailed list (false).
+    pub grid_view: bool,
 }
 
 impl Default for Settings {
@@ -41,13 +41,13 @@ impl Default for Settings {
             download_dir: default_download_dir(),
             download_limit_kib: 0,
             upload_limit_kib: 0,
-            throttle_upload_while_downloading: true,
-            upload_while_downloading_kib: 0,
+            upload_capacity_mbps: 0.0,
             max_peers_per_torrent: 250,
             listen_port: 4240,
             enable_utp: true,
             enable_upnp: true,
             extra_trackers: true,
+            grid_view: true,
         }
     }
 }
@@ -80,13 +80,11 @@ impl Settings {
     }
 
     pub fn upload_policy(&self) -> WhileDownloading {
-        match (
-            self.throttle_upload_while_downloading,
-            self.upload_while_downloading_kib,
-        ) {
-            (false, _) => WhileDownloading::Off,
-            (true, 0) => WhileDownloading::Auto,
-            (true, kib) => WhileDownloading::Fixed(u64::from(kib) * 1024),
+        if self.upload_capacity_mbps > 0.0 {
+            let bytes_per_sec = f64::from(self.upload_capacity_mbps) * 1_000_000.0 / 8.0;
+            WhileDownloading::Fixed((bytes_per_sec * upload_policy::CAPACITY_SHARE) as u64)
+        } else {
+            WhileDownloading::Off
         }
     }
 

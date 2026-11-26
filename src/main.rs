@@ -4,8 +4,10 @@
 mod app;
 mod engine;
 mod format;
+mod headless;
 mod settings;
 mod speed;
+mod theme;
 mod upload_policy;
 
 use eframe::egui;
@@ -22,12 +24,24 @@ fn main() -> eframe::Result {
     // a magnet: link handler) are queued and added once the window is up.
     let startup_args: Vec<String> = std::env::args().skip(1).collect();
 
+    if startup_args.first().map(String::as_str) == Some("--headless") {
+        if let Err(e) = headless::run(&startup_args[1..]) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rustorrent")
-            .with_inner_size([960.0, 600.0])
-            .with_min_inner_size([640.0, 360.0])
-            .with_drag_and_drop(true),
+            .with_inner_size([1080.0, 680.0])
+            .with_min_inner_size([760.0, 440.0])
+            .with_drag_and_drop(true)
+            // macOS: unified title bar, content runs under the traffic lights.
+            .with_fullsize_content_view(true)
+            .with_title_shown(false)
+            .with_titlebar_shown(false),
         ..Default::default()
     };
 
