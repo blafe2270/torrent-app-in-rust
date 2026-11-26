@@ -1,4 +1,4 @@
-//! `rustorrent --headless <torrent|magnet> [--out DIR]`
+//! `rustorrent --headless <torrent|magnet> [--out DIR] [--seed]`
 //!
 //! Downloads one torrent with exactly the same engine and settings as the GUI,
 //! printing progress to stdout, then exits. Handy for scripting and for
@@ -17,15 +17,17 @@ use crate::settings::{self, Settings};
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut source = None;
     let mut out = None;
+    let mut seed = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = it.next().map(PathBuf::from),
+            "--seed" => seed = true,
             _ => source = Some(a.clone()),
         }
     }
     let source = source.ok_or_else(|| {
-        anyhow::anyhow!("usage: rustorrent --headless <file.torrent|magnet> [--out DIR]")
+        anyhow::anyhow!("usage: rustorrent --headless <file.torrent|magnet> [--out DIR] [--seed]")
     })?;
 
     let mut settings = Settings::load();
@@ -86,7 +88,20 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
                     format::bytes(row.stats.total_bytes),
                     format::bytes((row.stats.total_bytes as f64 / secs) as u64)
                 );
-                break;
+                if !seed {
+                    break;
+                }
+                println!("Seeding; press Ctrl+C to stop.");
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    if let Some(r) = engine.torrents().into_iter().find(|r| Some(r.id) == id) {
+                        println!(
+                            "seeding  up {:>11}  uploaded {}",
+                            format::speed_bps(r.rates.up_bps),
+                            format::bytes(r.stats.uploaded_bytes)
+                        );
+                    }
+                }
             }
             if let Some(err) = &row.stats.error {
                 anyhow::bail!("torrent error: {err}");

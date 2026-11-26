@@ -25,3 +25,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[workspace]
+members = [".", "vendor/librqbit"]
+resolver = "3"
+
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
