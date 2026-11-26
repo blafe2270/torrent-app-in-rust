@@ -36,7 +36,13 @@ every tagged release on the **Releases** page:
 Out of the box Rustorrent is configured to download as fast as your
 connection allows:
 
-- **No bandwidth limits**
+- **No download limit**
+- **Upload is held back while anything is downloading** (Auto: 25% of your
+  current download speed, at least 256 KiB/s). librqbit uploads to every
+  peer that asks, which can max out your upload; a maxed-out upload delays the
+  acknowledgements your downloads depend on and drags download speed down.
+  Once everything has finished, upload goes back to unlimited for seeding.
+  Adjustable or switchable off in Settings
 - **Up to 250 peers per torrent** (adjustable up to 2000)
 - **TCP + uTP** connections, so more peers are reachable
 - **UPnP port forwarding**, so peers can connect *to* you (the single biggest

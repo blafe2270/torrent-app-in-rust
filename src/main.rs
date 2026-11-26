@@ -6,6 +6,7 @@ mod engine;
 mod format;
 mod settings;
 mod speed;
+mod upload_policy;
 
 use eframe::egui;
 

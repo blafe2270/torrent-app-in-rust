@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::upload_policy::WhileDownloading;
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -16,6 +18,11 @@ pub struct Settings {
     pub download_limit_kib: u32,
     /// Global upload limit in KiB/s. 0 = unlimited.
     pub upload_limit_kib: u32,
+    /// Throttle upload while anything is still downloading, so a saturated
+    /// upstream doesn't slow downloads.
+    pub throttle_upload_while_downloading: bool,
+    /// Upload cap (KiB/s) while downloading. 0 = automatic.
+    pub upload_while_downloading_kib: u32,
     /// Maximum connected peers per torrent.
     pub max_peers_per_torrent: usize,
     /// TCP/uTP port for incoming peer connections.
@@ -34,6 +41,8 @@ impl Default for Settings {
             download_dir: default_download_dir(),
             download_limit_kib: 0,
             upload_limit_kib: 0,
+            throttle_upload_while_downloading: true,
+            upload_while_downloading_kib: 0,
             max_peers_per_torrent: 250,
             listen_port: 4240,
             enable_utp: true,
@@ -67,6 +76,17 @@ impl Settings {
                 }
             }
             Err(e) => tracing::warn!("could not serialize settings: {e}"),
+        }
+    }
+
+    pub fn upload_policy(&self) -> WhileDownloading {
+        match (
+            self.throttle_upload_while_downloading,
+            self.upload_while_downloading_kib,
+        ) {
+            (false, _) => WhileDownloading::Off,
+            (true, 0) => WhileDownloading::Auto,
+            (true, kib) => WhileDownloading::Fixed(u64::from(kib) * 1024),
         }
     }
 

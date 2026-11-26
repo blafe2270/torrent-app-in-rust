@@ -24,6 +24,11 @@ use librqbit::{
 
 use crate::settings::{PUBLIC_TRACKERS, Settings};
 use crate::speed::{self, Rates, SpeedTracker};
+use crate::upload_policy::{self, WhileDownloading};
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 use eframe::egui;
 use tokio::runtime::Runtime;
 
@@ -100,6 +105,20 @@ pub struct Engine {
     events: Sender<Event>,
     repaint: egui::Context,
     speeds: Mutex<HashMap<usize, SpeedTracker>>,
+    upload: Arc<Mutex<UploadState>>,
+}
+
+/// Inputs and current output of the upload policy (see `upload_policy`).
+struct UploadState {
+    /// User's own upload limit, bytes/s.
+    user_limit: Option<u64>,
+    mode: WhileDownloading,
+    /// Limit currently applied to the session.
+    applied: Option<u64>,
+    /// Whether the cap is currently active because something is downloading.
+    throttling: bool,
+    /// Force re-applying on the next tick (settings changed).
+    dirty: bool,
 }
 
 impl Engine {
@@ -154,8 +173,16 @@ impl Engine {
             events,
             repaint,
             speeds: Mutex::new(HashMap::new()),
+            upload: Arc::new(Mutex::new(UploadState {
+                user_limit: None,
+                mode: WhileDownloading::Off,
+                applied: None,
+                throttling: false,
+                dirty: true,
+            })),
         };
         engine.apply_live_settings(settings);
+        engine.spawn_upload_governor();
         Ok(engine)
     }
 
@@ -165,9 +192,60 @@ impl Engine {
         self.session
             .ratelimits
             .set_download_bps(kib_to_bps(settings.download_limit_kib));
-        self.session
-            .ratelimits
-            .set_upload_bps(kib_to_bps(settings.upload_limit_kib));
+        let mut up = lock(&self.upload);
+        up.user_limit =
+            (settings.upload_limit_kib > 0).then(|| u64::from(settings.upload_limit_kib) * 1024);
+        up.mode = settings.upload_policy();
+        up.dirty = true;
+    }
+
+    /// The upload cap currently in force because something is downloading,
+    /// if any (bytes/s).
+    pub fn upload_throttle(&self) -> Option<u64> {
+        let up = lock(&self.upload);
+        if up.throttling { up.applied } else { None }
+    }
+
+    /// Once a second: measure total download speed and set the session's
+    /// upload limit according to the upload policy.
+    fn spawn_upload_governor(&self) {
+        let session = Arc::downgrade(&self.session);
+        let state = self.upload.clone();
+        self.rt.spawn(async move {
+            let mut tracker = SpeedTracker::default();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                let handles: Vec<Arc<librqbit::ManagedTorrent>> =
+                    session.with_torrents(|iter| iter.map(|(_, t)| t.clone()).collect());
+                let mut downloading = false;
+                let mut fetched = 0u64;
+                for t in &handles {
+                    let stats = t.stats();
+                    if let Some(live) = &stats.live {
+                        fetched += live.snapshot.fetched_bytes;
+                        downloading |= !stats.finished;
+                    }
+                }
+                let down_bps = tracker.update(Instant::now(), fetched, 0).down_bps;
+
+                let mut st = lock(&state);
+                let target =
+                    upload_policy::target_limit(st.user_limit, st.mode, downloading, down_bps);
+                if st.dirty || upload_policy::should_apply(st.applied, target) {
+                    session.ratelimits.set_upload_bps(
+                        target.and_then(|b| NonZeroU32::new(b.min(u64::from(u32::MAX)) as u32)),
+                    );
+                    st.applied = target;
+                    st.dirty = false;
+                }
+                st.throttling =
+                    downloading && st.mode != WhileDownloading::Off && st.applied != st.user_limit;
+            }
+        });
     }
 
     pub fn set_max_peers(&mut self, n: usize) {

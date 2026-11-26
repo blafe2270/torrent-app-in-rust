@@ -221,7 +221,10 @@ impl TorrentApp {
                 );
             }
             ui.label(format!("⬆ {}", format::speed_bps(up)));
-            if self.settings.upload_limit_kib > 0 {
+            if let Some(cap) = self.engine.upload_throttle() {
+                ui.label(RichText::new(format!("(capped at {}/s while downloading)", format::bytes(cap))).weak())
+                    .on_hover_text("Upload is held back while anything is downloading so it can't clog your connection and slow downloads. It goes back to normal once downloads finish. Change this in Settings.");
+            } else if self.settings.upload_limit_kib > 0 {
                 ui.label(
                     RichText::new(format!(
                         "(limit {}/s)",
@@ -510,6 +513,34 @@ impl TorrentApp {
                         limit_row(ui, "Download limit", &mut draft.download_limit_kib);
                         ui.end_row();
                         limit_row(ui, "Upload limit", &mut draft.upload_limit_kib);
+                        ui.end_row();
+                        ui.label("While downloading");
+                        ui.vertical(|ui| {
+                            ui.checkbox(
+                                &mut draft.throttle_upload_while_downloading,
+                                "Hold back upload so it can't slow downloads",
+                            )
+                            .on_hover_text("A maxed-out upload delays the acknowledgements your downloads depend on. Upload returns to normal once everything has finished downloading.");
+                            if draft.throttle_upload_while_downloading {
+                                ui.horizontal(|ui| {
+                                    let mut auto = draft.upload_while_downloading_kib == 0;
+                                    if ui.radio_value(&mut auto, true, "Auto").on_hover_text("25% of your current download speed, at least 256 KiB/s").changed() {
+                                        draft.upload_while_downloading_kib = 0;
+                                    }
+                                    if ui.radio_value(&mut auto, false, "Fixed").changed() && !auto {
+                                        draft.upload_while_downloading_kib = 512;
+                                    }
+                                    if !auto {
+                                        ui.add(
+                                            egui::DragValue::new(&mut draft.upload_while_downloading_kib)
+                                                .range(16..=4_000_000)
+                                                .speed(16.0)
+                                                .suffix(" KiB/s"),
+                                        );
+                                    }
+                                });
+                            }
+                        });
                         ui.end_row();
                         ui.label("Max peers per torrent");
                         ui.add(egui::DragValue::new(&mut draft.max_peers_per_torrent).range(10..=2000))
