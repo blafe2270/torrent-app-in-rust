@@ -46,11 +46,15 @@ mod imp {
         let icon_data = eframe::icon_data::from_png_bytes(png).ok()?;
         let icon = Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height).ok()?;
 
-        let tray = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Rustorrent")
-            .with_icon(icon)
-            .with_icon_as_template(template)
+            .with_tooltip("Rustorrent");
+        let builder = if template {
+            builder.with_icon_templated(icon)
+        } else {
+            builder.with_icon(icon)
+        };
+        let tray = builder
             .build()
             .map_err(|e| tracing::warn!("tray icon unavailable: {e}"))
             .ok()?;
@@ -64,12 +68,14 @@ mod imp {
         ];
         let menu_tx = tx.clone();
         let menu_wake = wake.clone();
-        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-            if let Some((_, a)) = ids.iter().find(|(id, _)| *id == e.id) {
-                let _ = menu_tx.send(*a);
-                menu_wake();
-            }
-        }));
+        let handler: tray_icon::menu::MenuEventHandler =
+            std::sync::Arc::new(move |e: MenuEvent| {
+                if let Some((_, a)) = ids.iter().find(|(id, _)| *id == e.id) {
+                    let _ = menu_tx.send(*a);
+                    menu_wake();
+                }
+            });
+        MenuEvent::set_event_handler(Some(handler));
         // Windows: left-click on the icon shows the window.
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
             if let TrayIconEvent::Click {

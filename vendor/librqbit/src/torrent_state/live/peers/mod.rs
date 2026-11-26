@@ -59,9 +59,19 @@ impl PeerStates {
                 if add {
                     a.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let _ = a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    });
+                    // Saturating decrement.
+                    let mut cur = a.load(Ordering::Relaxed);
+                    while cur > 0 {
+                        match a.compare_exchange_weak(
+                            cur,
+                            cur - 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => cur = actual,
+                        }
+                    }
                 }
             }
         }

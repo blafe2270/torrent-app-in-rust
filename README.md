@@ -6,13 +6,21 @@ A fast, simple BitTorrent client written in Rust, with a native GUI for
 - macOS-style interface: floating sidebar, icon grid or list view, capsule
   toolbar, light & dark appearance (follows the system)
 - Add torrents from `.torrent` files, magnet links or URLs — or drag & drop files onto the window
-- Pick which files to download and where to save them
-- Pause / resume / remove (optionally deleting files)
-- Live progress, download/upload speed, peers and ETA
+- Pick which files to download and where to save them; change it later in the inspector
+- Inspector panel: info, piece map, per-file progress and selection, peers, trackers
+- Download queue (3 at once by default), stop-seeding limits (ratio / time)
+- Desktop notification when a download finishes
+- Opens magnet links and .torrent files from your browser / file manager
+  (Settings → Integration), and forwards them to the already-open window
+- Menu-bar (macOS) / notification-area (Windows) icon; closing the window
+  keeps downloads running
 - Torrents and progress survive restarts (fast resume)
 - **Tuned for speed by default**, with optional download/upload limits
+- Command-line mode: `rustorrent --headless file.torrent [--out DIR] [--seed]`
 
-Built on [librqbit](https://github.com/ikatson/rqbit) (BitTorrent engine) and
+Built on [librqbit](https://github.com/ikatson/rqbit) (BitTorrent engine,
+vendored in `vendor/librqbit` with Rustorrent's extensions: protocol
+encryption, rarest-first piece selection and web seeds) and
 [egui/eframe](https://github.com/emilk/egui) (GUI).
 
 ## Download
@@ -27,8 +35,10 @@ every tagged release on the **Releases** page:
 | macOS 11+ (Apple Silicon & Intel) | `rustorrent-macos-universal.zip` → `Rustorrent.app` |
 | Linux (x64, glibc 2.35+) | `rustorrent-linux-x86_64.tar.gz` → run `./rustorrent` |
 
-**macOS note:** the app is not notarized, so the first time right-click
-`Rustorrent.app` → **Open** (or run `xattr -dr com.apple.quarantine Rustorrent.app`).
+**macOS note:** unless the release was signed (see *Signing the Mac app*
+below), the first time right-click `Rustorrent.app` → **Open** (or run
+`xattr -dr com.apple.quarantine Rustorrent.app`). Move it to Applications
+before using Settings → Integration, so macOS remembers it as the handler.
 
 **Windows note:** SmartScreen may warn about an unrecognized app; click
 **More info → Run anyway**.
@@ -59,6 +69,18 @@ connection allows:
   your CPU) instead of librqbit's default 8, so slow disks or antivirus
   scanning don't stall incoming data
 - Peer exchange (PEX) and DHT keep discovering new peers while downloading
+- **Protocol encryption (MSE/PE)**, like qBittorrent: connections are
+  encrypted when the peer supports it, which gets around ISP throttling of
+  BitTorrent traffic and reaches peers that only accept encrypted
+  connections. Falls back to plaintext for peers without it (Settings →
+  Encryption: Prefer / Require / Off). Tested against libtorrent in both
+  directions, over TCP and uTP.
+- **Rarest-first piece selection**: pieces few peers have are fetched first,
+  so downloads don't stall near the end and other peers value us more
+- **Web seeds** (BEP 19): torrents that list HTTP mirrors (Linux ISOs,
+  archive.org, …) download from the mirror in parallel with peers
+- **Download queue**: only 3 torrents download at once by default, so each
+  one gets the full bandwidth and finishes sooner
 
 The speed shown in the app is averaged over 5 seconds. BitTorrent data
 arrives in bursts, so an instantaneous reading jumps around even when the real
@@ -93,6 +115,25 @@ above off.
 Tips if downloads are still slow: make sure UPnP is enabled on your router (or
 forward the listening port, default `4240`, TCP+UDP, manually) and allow
 Rustorrent through your firewall when asked.
+
+## Signing the Mac app
+
+The build signs the app with a Developer ID and notarizes it automatically
+when these repository secrets exist (otherwise it ships ad-hoc signed):
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERTIFICATE` | your *Developer ID Application* certificate exported as `.p12`, base64-encoded |
+| `MACOS_CERTIFICATE_PASSWORD` | the `.p12` password |
+| `APPLE_ID` | your Apple ID email |
+| `APPLE_TEAM_ID` | your 10-character team ID |
+| `APPLE_APP_PASSWORD` | an [app-specific password](https://support.apple.com/HT204397) |
+
+## Publishing a release
+
+Actions → **Build** → **Run workflow**, enter a tag like `v0.3.0` (it must
+match the version in `Cargo.toml`). All three platforms are built and attached
+to a new GitHub release.
 
 ## Build from source
 
