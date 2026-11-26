@@ -10,8 +10,10 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use anyhow::Context as _;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use librqbit::limits::LimitsConfig;
 use librqbit::{
@@ -21,6 +23,7 @@ use librqbit::{
 };
 
 use crate::settings::{PUBLIC_TRACKERS, Settings};
+use crate::speed::{self, Rates, SpeedTracker};
 use eframe::egui;
 use tokio::runtime::Runtime;
 
@@ -55,6 +58,10 @@ pub struct TorrentRow {
     pub name: String,
     pub output_folder: PathBuf,
     pub stats: TorrentStats,
+    /// Download/upload speed averaged over a few seconds (bytes/s).
+    pub rates: Rates,
+    /// Time left at the averaged download speed.
+    pub eta: Option<Duration>,
 }
 
 impl TorrentRow {
@@ -92,6 +99,7 @@ pub struct Engine {
     max_peers_per_torrent: usize,
     events: Sender<Event>,
     repaint: egui::Context,
+    speeds: Mutex<HashMap<usize, SpeedTracker>>,
 }
 
 impl Engine {
@@ -145,6 +153,7 @@ impl Engine {
             max_peers_per_torrent: settings.max_peers_per_torrent,
             events,
             repaint,
+            speeds: Mutex::new(HashMap::new()),
         };
         engine.apply_live_settings(settings);
         Ok(engine)
@@ -298,15 +307,50 @@ impl Engine {
     }
 
     pub fn torrents(&self) -> Vec<TorrentRow> {
-        let mut rows = self.session.with_torrents(|iter| {
-            iter.map(|(id, t)| TorrentRow {
-                id,
-                name: t.name().unwrap_or_else(|| t.info_hash().as_string()),
-                output_folder: t.output_folder().to_path_buf(),
-                stats: t.stats(),
+        let now = Instant::now();
+        // Grab cheap handles first so the session lock is held only briefly.
+        let handles: Vec<(usize, Arc<librqbit::ManagedTorrent>)> = self
+            .session
+            .with_torrents(|iter| iter.map(|(id, t)| (id, t.clone())).collect());
+
+        let mut speeds = self.speeds.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<TorrentRow> = handles
+            .into_iter()
+            .map(|(id, t)| {
+                let stats = t.stats();
+                let rates = match &stats.live {
+                    Some(live) => speeds.entry(id).or_default().update(
+                        now,
+                        live.snapshot.fetched_bytes,
+                        live.snapshot.uploaded_bytes,
+                    ),
+                    None => {
+                        speeds.remove(&id);
+                        Rates::default()
+                    }
+                };
+                let mut rates = rates;
+                let eta = if stats.finished {
+                    // Nothing left to download; don't show the tail of the
+                    // averaging window as a download speed while seeding.
+                    rates.down_bps = 0.0;
+                    None
+                } else {
+                    let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
+                    speed::eta(remaining, rates.down_bps)
+                };
+                TorrentRow {
+                    id,
+                    name: t.name().unwrap_or_else(|| t.info_hash().as_string()),
+                    output_folder: t.output_folder().to_path_buf(),
+                    stats,
+                    rates,
+                    eta,
+                }
             })
-            .collect::<Vec<_>>()
-        });
+            .collect();
+        // Forget trackers of removed torrents.
+        speeds.retain(|id, _| rows.iter().any(|r| r.id == *id));
         rows.sort_by_key(|r| r.id);
         rows
     }
@@ -370,6 +414,11 @@ impl Engine {
     }
 }
 
+fn disk_io_slots() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores * 4).clamp(16, 64)
+}
+
 fn kib_to_bps(kib: u32) -> Option<NonZeroU32> {
     NonZeroU32::new(kib.saturating_mul(1024))
 }
@@ -427,6 +476,12 @@ async fn create_session(
             ..Default::default()
         }),
         peer_limit: Some(settings.max_peers_per_torrent),
+        // librqbit funnels every received-chunk disk write and every piece
+        // hash check through this many concurrent slots (default 8, shared by
+        // all torrents). With hundreds of peers that queue backs up, peers'
+        // data sits unread and throughput turns bursty. Writes land in the OS
+        // page cache and SHA-1 is CPU-bound, so scale with the core count.
+        runtime_worker_threads: Some(disk_io_slots()),
         trackers,
         ratelimits: LimitsConfig {
             download_bps: kib_to_bps(settings.download_limit_kib),

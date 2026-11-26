@@ -5,6 +5,7 @@ mod app;
 mod engine;
 mod format;
 mod settings;
+mod speed;
 
 use eframe::egui;
 

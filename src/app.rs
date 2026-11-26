@@ -11,6 +11,7 @@ use crate::format;
 use crate::settings::{self, Settings};
 
 const MAX_LOG_LINES: usize = 200;
+const ROWS_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 struct LogLine {
     at: Instant,
@@ -44,6 +45,10 @@ pub struct TorrentApp {
     running_settings: Settings,
     /// Editable copy while the settings window is open.
     settings_draft: Option<Settings>,
+    /// Last torrent snapshot; refreshed a few times per second rather than
+    /// on every repaint so the UI never competes with the download engine.
+    rows: Vec<TorrentRow>,
+    rows_refreshed: Option<Instant>,
 }
 
 impl TorrentApp {
@@ -67,6 +72,8 @@ impl TorrentApp {
             events: rx,
             running_settings: settings.clone(),
             settings_draft: None,
+            rows: Vec::new(),
+            rows_refreshed: None,
             settings,
             magnet_input: String::new(),
             add_queue: Vec::new(),
@@ -199,14 +206,11 @@ impl TorrentApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, rows: &[TorrentRow]) {
-        let (down, up) = rows
-            .iter()
-            .fold((0.0, 0.0), |(d, u), r| match &r.stats.live {
-                Some(l) => (d + l.download_speed.mbps, u + l.upload_speed.mbps),
-                None => (d, u),
-            });
+        let (down, up) = rows.iter().fold((0.0, 0.0), |(d, u), r| {
+            (d + r.rates.down_bps, u + r.rates.up_bps)
+        });
         ui.horizontal(|ui| {
-            ui.label(format!("⬇ {}", format::speed_mibps(down)));
+            ui.label(format!("⬇ {}", format::speed_bps(down)));
             if self.settings.download_limit_kib > 0 {
                 ui.label(
                     RichText::new(format!(
@@ -216,7 +220,7 @@ impl TorrentApp {
                     .weak(),
                 );
             }
-            ui.label(format!("⬆ {}", format::speed_mibps(up)));
+            ui.label(format!("⬆ {}", format::speed_bps(up)));
             if self.settings.upload_limit_kib > 0 {
                 ui.label(
                     RichText::new(format!(
@@ -358,19 +362,14 @@ impl TorrentApp {
                     ));
                     if let Some(live) = &row.stats.live {
                         ui.separator();
-                        ui.label(format!(
-                            "⬇ {}",
-                            format::speed_mibps(live.download_speed.mbps)
-                        ));
-                        ui.label(format!("⬆ {}", format::speed_mibps(live.upload_speed.mbps)));
+                        ui.label(format!("⬇ {}", format::speed_bps(row.rates.down_bps)));
+                        ui.label(format!("⬆ {}", format::speed_bps(row.rates.up_bps)));
                         ui.separator();
                         let peers = &live.snapshot.peer_stats;
                         ui.label(format!("Peers: {} ({} seen)", peers.live, peers.seen));
-                        if !row.stats.finished
-                            && let Some(eta) = &live.time_remaining
-                        {
+                        if let Some(eta) = row.eta {
                             ui.separator();
-                            ui.label(format!("ETA: {eta}"));
+                            ui.label(format!("ETA: {}", format::duration(eta)));
                         }
                     }
                     ui.separator();
@@ -633,7 +632,14 @@ impl eframe::App for TorrentApp {
         self.drain_events();
         self.handle_dropped_files(&ctx);
 
-        let rows = self.engine.torrents();
+        if self
+            .rows_refreshed
+            .is_none_or(|t| t.elapsed() >= ROWS_REFRESH_INTERVAL)
+        {
+            self.rows = self.engine.torrents();
+            self.rows_refreshed = Some(Instant::now());
+        }
+        let rows = std::mem::take(&mut self.rows);
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &rows));
@@ -665,6 +671,7 @@ impl eframe::App for TorrentApp {
         self.settings_window(&ctx);
         self.add_dialog(&ctx);
         self.remove_dialog(&ctx);
+        self.rows = rows;
 
         // Keep stats fresh even without user input.
         ctx.request_repaint_after(Duration::from_millis(1000));

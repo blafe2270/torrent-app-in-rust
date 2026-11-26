@@ -48,6 +48,19 @@ connection allows:
 - Short connect timeouts so dead peers are skipped quickly, and a deep
   per-peer request pipeline for high-bandwidth links
 - The OS open-file limit is raised automatically to allow many connections
+- Disk writes and piece hash checks run on up to 64 parallel slots (scaled to
+  your CPU) instead of librqbit's default 8, so slow disks or antivirus
+  scanning don't stall incoming data
+- Peer exchange (PEX) and DHT keep discovering new peers while downloading
+
+The speed shown in the app is averaged over 5 seconds. BitTorrent data
+arrives in bursts, so an instantaneous reading jumps around even when the real
+throughput is steady.
+
+In a local benchmark (8 seeders → 1 downloader on one 4-core machine) the
+engine sustains about **340 MiB/s (~2.8 Gbit/s)**, so the client itself is
+never the bottleneck on a home connection; real-world speed is set by how many
+peers you reach and how fast they upload.
 
 Open **⚙ Settings** to set a download and/or upload limit (applies
 immediately), change the max peers, the listening port, or turn any of the

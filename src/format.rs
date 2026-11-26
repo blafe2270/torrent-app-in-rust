@@ -15,13 +15,28 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-/// librqbit reports speeds in MiB/s.
-pub fn speed_mibps(mibps: f64) -> String {
-    let bps = (mibps * 1024.0 * 1024.0).max(0.0) as u64;
+/// Bytes per second → "1.5 MiB/s".
+pub fn speed_bps(bps: f64) -> String {
+    let bps = bps.max(0.0) as u64;
     if bps < 1024 {
         "–".into()
     } else {
         format!("{}/s", bytes(bps))
+    }
+}
+
+/// "2h 05m", "4m 09s", "12s".
+pub fn duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h >= 100 {
+        "∞".into()
+    } else if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -39,7 +54,9 @@ mod tests {
 
     #[test]
     fn formats_speed() {
-        assert_eq!(speed_mibps(0.0), "–");
-        assert_eq!(speed_mibps(1.0), "1.0 MiB/s");
+        assert_eq!(speed_bps(0.0), "–");
+        assert_eq!(speed_bps(1024.0 * 1024.0), "1.0 MiB/s");
+        assert_eq!(duration(std::time::Duration::from_secs(3725)), "1h 02m");
+        assert_eq!(duration(std::time::Duration::from_secs(65)), "1m 05s");
     }
 }
