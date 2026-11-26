@@ -111,11 +111,13 @@ pub(crate) fn url_list(torrent: &[u8]) -> Vec<String> {
 /// Start workers for every web seed in the torrent.
 pub(crate) fn spawn_all(state: &Arc<TorrentStateLive>, client: reqwest::Client) {
     let urls = url_list(&state.metadata.torrent_bytes);
-    for (seed_idx, url) in urls.into_iter().enumerate() {
+    for (seed_idx, url) in (0u16..).zip(urls) {
         debug!(%url, "starting web seed");
         for w in 0..WORKERS_PER_SEED {
             // Virtual peer address: 0.0.0.0 is never a real peer.
-            let port = 1 + (seed_idx as u16).saturating_mul(WORKERS_PER_SEED) + w;
+            let port = 1u16
+                .saturating_add(seed_idx.saturating_mul(WORKERS_PER_SEED))
+                .saturating_add(w);
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let weak = Arc::downgrade(state);
             let url = url.clone();
@@ -230,6 +232,8 @@ fn file_url(
     Ok(url)
 }
 
+// A piece is at most a few MiB, so these u64 -> usize casts can't truncate.
+#[allow(clippy::cast_possible_truncation)]
 async fn download_piece(
     state: &Arc<TorrentStateLive>,
     client: &reqwest::Client,

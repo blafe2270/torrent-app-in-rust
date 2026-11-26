@@ -45,6 +45,7 @@ jobs:
           mkdir -p dist/rustorrent-linux-x86_64
           cp target/release/rustorrent dist/rustorrent-linux-x86_64/
           cp packaging/linux/rustorrent.desktop README.md LICENSE dist/rustorrent-linux-x86_64/
+          cp assets/icon-256.png dist/rustorrent-linux-x86_64/rustorrent.png
           tar -C dist -czf rustorrent-linux-x86_64.tar.gz rustorrent-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
@@ -73,6 +74,13 @@ jobs:
   macos:
     name: macOS (universal)
     runs-on: macos-latest
+    env:
+      # Optional: set these repository secrets to sign and notarize the app.
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,13 +93,33 @@ jobs:
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           APP=dist/Rustorrent.app
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp assets/icon.icns "$APP/Contents/Resources/AppIcon.icns"
           lipo -create -output "$APP/Contents/MacOS/rustorrent" \
             target/aarch64-apple-darwin/release/rustorrent \
             target/x86_64-apple-darwin/release/rustorrent
           sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
-          # Ad-hoc signature so Apple Silicon will run it.
+          # Ad-hoc signature so Apple Silicon will run it (replaced below
+          # by a Developer ID signature when credentials are configured).
           codesign --force --deep --sign - "$APP"
+      - name: Sign and notarize
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          APP=dist/Rustorrent.app
+          echo "$MACOS_CERTIFICATE" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+          ditto -c -k --keepParent "$APP" notarize.zip
+          xcrun notarytool submit notarize.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$APP"
+          rm -f cert.p12 notarize.zip
+      - name: Package
+        run: |
           cp README.md LICENSE dist/
           ditto -c -k --keepParent dist/Rustorrent.app rustorrent-macos-universal.zip
       - uses: actions/upload-artifact@v4

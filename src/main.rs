@@ -5,6 +5,7 @@ mod app;
 mod engine;
 mod format;
 mod headless;
+mod platform;
 mod settings;
 mod speed;
 mod theme;
@@ -32,12 +33,23 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // Already running? Hand the torrents/links to that window and exit.
+    if platform::instance::forward_or_listen(&startup_args) {
+        return Ok(());
+    }
+    // macOS delivers clicked links / opened files as Apple events.
+    #[cfg(target_os = "macos")]
+    platform::macos::install_open_url_handler();
+
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
+        .expect("embedded icon is a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rustorrent")
             .with_inner_size([1080.0, 680.0])
             .with_min_inner_size([760.0, 440.0])
             .with_drag_and_drop(true)
+            .with_icon(icon)
             // macOS: unified title bar, content runs under the traffic lights.
             .with_fullsize_content_view(true)
             .with_title_shown(false)

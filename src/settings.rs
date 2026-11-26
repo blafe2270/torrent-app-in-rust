@@ -44,6 +44,9 @@ pub struct Settings {
     pub notify_on_complete: bool,
     /// MSE/PE protocol encryption.
     pub encryption: EncryptionMode,
+    /// Keep running in the menu bar / notification area when the window is
+    /// closed (macOS and Windows).
+    pub close_to_tray: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
@@ -77,6 +80,7 @@ impl Default for Settings {
             seed_time_limit_min: 0,
             notify_on_complete: true,
             encryption: EncryptionMode::Prefer,
+            close_to_tray: true,
         }
     }
 }

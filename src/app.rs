@@ -12,6 +12,7 @@ use eframe::egui::{
 
 use crate::engine::{Engine, Event, PendingTorrent, TorrentDetails, TorrentRow, TorrentSource};
 use crate::format;
+use crate::platform::{self, tray::TrayAction};
 use crate::settings::{self, Settings};
 use crate::theme::{self, Icon, Palette};
 
@@ -93,6 +94,11 @@ pub struct TorrentApp {
     rows_refreshed: Option<Instant>,
     down_history: VecDeque<f64>,
     history_sampled: Option<Instant>,
+    /// Torrents/links from a second launch or the OS (see `platform`).
+    incoming: Receiver<String>,
+    tray: Option<platform::tray::Tray>,
+    /// Set when the user really wants to quit (not just close the window).
+    quitting: bool,
 }
 
 impl TorrentApp {
@@ -113,7 +119,20 @@ impl TorrentApp {
         let engine = Engine::new(rt, &settings, settings::data_dir(), tx, cc.egui_ctx.clone())
             .map_err(|e| format!("{e:#}"))?;
 
+        // Links/files from other launches or the OS arrive here.
+        let (in_tx, in_rx) = channel();
+        let ctx = cc.egui_ctx.clone();
+        platform::set_sink(move |arg| {
+            let _ = in_tx.send(arg);
+            ctx.request_repaint();
+        });
+        let ctx = cc.egui_ctx.clone();
+        let tray = platform::tray::create(move || ctx.request_repaint());
+
         let mut app = Self {
+            incoming: in_rx,
+            tray,
+            quitting: false,
             engine,
             events: rx,
             running_settings: settings.clone(),
@@ -1236,6 +1255,7 @@ impl TorrentApp {
         };
         let mut save = false;
         let mut cancel = false;
+        let mut register_result: Option<(String, bool)> = None;
         let running = &self.running_settings;
 
         let modal = egui::Modal::new(egui::Id::unique("settings_modal")).show(ctx, |ui| {
@@ -1329,6 +1349,33 @@ impl TorrentApp {
                     hint(ui, &p, "Network changes take effect after restarting Rustorrent.");
 
                     ui.add_space(14.0);
+                    group_title(ui, &p, "INTEGRATION");
+                    settings_group(ui, &p, |ui| {
+                        setting_row(ui, "Magnet links & .torrent files", |ui| {
+                            if ui.button("Open with Rustorrent").clicked() {
+                                match platform::register::register_handlers() {
+                                    Ok(msg) => register_result = Some((msg, false)),
+                                    Err(e) => register_result = Some((format!("{e:#}"), true)),
+                                }
+                            }
+                        });
+                        if platform::tray::SUPPORTED {
+                            separator(ui, &p);
+                            setting_row(
+                                ui,
+                                if cfg!(target_os = "macos") {
+                                    "Keep running in the menu bar when closed"
+                                } else {
+                                    "Keep running in the notification area when closed"
+                                },
+                                |ui| {
+                                    theme::toggle(ui, &mut draft.close_to_tray);
+                                },
+                            );
+                        }
+                    });
+
+                    ui.add_space(14.0);
                     group_title(ui, &p, "QUEUE & SEEDING");
                     settings_group(ui, &p, |ui| {
                         setting_row(ui, "Downloads at once", |ui| {
@@ -1407,6 +1454,9 @@ impl TorrentApp {
             });
         });
 
+        if let Some((msg, is_error)) = register_result {
+            self.push_log(msg, is_error);
+        }
         if save {
             let mut new = self.settings_draft.take().expect("checked above");
             // The save folder is chosen per torrent; keep whatever is current.
@@ -1460,7 +1510,50 @@ impl TorrentApp {
     }
 }
 
+impl TorrentApp {
+    fn show_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+}
+
 impl eframe::App for TorrentApp {
+    /// Runs even while the window is hidden in the tray/menu bar.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(arg) = self.incoming.try_recv() {
+            if !arg.trim().is_empty() {
+                self.engine.fetch_metadata(TorrentSource::from_arg(&arg));
+            }
+            Self::show_window(ctx);
+        }
+        let actions: Vec<TrayAction> = self
+            .tray
+            .as_ref()
+            .map(|t| t.actions.try_iter().collect())
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Show => Self::show_window(ctx),
+                TrayAction::PauseAll => self.engine.pause_all(),
+                TrayAction::ResumeAll => self.engine.resume_all(),
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        // Closing the window keeps downloads running in the tray/menu bar.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && self.tray.is_some()
+            && self.settings.close_to_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_events();

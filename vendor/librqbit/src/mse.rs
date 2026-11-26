@@ -104,8 +104,8 @@ pub(crate) struct Rc4 {
 impl Rc4 {
     fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
-        for (i, v) in s.iter_mut().enumerate() {
-            *v = i as u8;
+        for (v, i) in s.iter_mut().zip(0..=255u8) {
+            *v = i;
         }
         let mut j: u8 = 0;
         for i in 0..256 {
@@ -540,8 +540,8 @@ mod tests {
     fn rc4_known_vector() {
         // RC4("Key", "Plaintext") = BBF316E8D940AF0AD3 (without the MSE discard).
         let mut s = [0u8; 256];
-        for (i, v) in s.iter_mut().enumerate() {
-            *v = i as u8;
+        for (v, i) in s.iter_mut().zip(0..=255u8) {
+            *v = i;
         }
         let key = b"Key";
         let mut j: u8 = 0;

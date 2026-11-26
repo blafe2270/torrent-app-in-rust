@@ -757,6 +757,28 @@ impl Engine {
         );
     }
 
+    pub fn pause_all(&self) {
+        let ids: Vec<usize> = self
+            .session
+            .with_torrents(|it| it.map(|(id, _)| id).collect());
+        for id in ids {
+            self.pause(id);
+        }
+    }
+
+    /// Resume everything that isn't waiting in the download queue.
+    pub fn resume_all(&self) {
+        let queued = lock(&self.gov).queued.clone();
+        let ids: Vec<usize> = self.session.with_torrents(|it| {
+            it.filter(|(id, t)| !queued.contains(id) && t.is_paused())
+                .map(|(id, _)| id)
+                .collect()
+        });
+        for id in ids {
+            self.resume(id);
+        }
+    }
+
     /// Resume (or force-start a queued torrent).
     pub fn resume(&self, id: usize) {
         let mut g = lock(&self.gov);
