@@ -23,9 +23,9 @@ use librqbit::{
 };
 
 use crate::settings::{EncryptionMode, PUBLIC_TRACKERS, Settings};
-use librqbit::mse::EncryptionPolicy;
 use crate::speed::{self, Rates, SpeedTracker};
 use crate::upload_policy::{self, WhileDownloading};
+use librqbit::mse::EncryptionPolicy;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -104,6 +104,38 @@ impl TorrentRow {
     }
 }
 
+/// Everything the inspector panel shows for one torrent.
+pub struct TorrentDetails {
+    pub info_hash: String,
+    pub save_path: PathBuf,
+    pub piece_length: u32,
+    pub pieces: u32,
+    pub files: Vec<FileDetail>,
+    pub peers: Vec<PeerDetail>,
+    pub trackers: Vec<String>,
+    /// Fraction downloaded per range of the torrent (empty when not running).
+    pub piece_map: Vec<f32>,
+    pub web_seeds: usize,
+}
+
+pub struct FileDetail {
+    /// Index in the torrent's file list (for `set_file_included`).
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
+    pub done: u64,
+    pub included: bool,
+}
+
+pub struct PeerDetail {
+    pub addr: SocketAddr,
+    pub client: String,
+    pub utp: bool,
+    pub down_bps: f64,
+    pub up_bps: f64,
+    pub have: f32,
+}
+
 pub struct Engine {
     rt: Runtime,
     session: Arc<Session>,
@@ -113,6 +145,7 @@ pub struct Engine {
     speeds: Mutex<HashMap<usize, SpeedTracker>>,
     upload: Arc<Mutex<UploadState>>,
     gov: Arc<Mutex<Governor>>,
+    peer_speeds: Mutex<HashMap<(usize, SocketAddr), SpeedTracker>>,
 }
 
 /// Queue, seeding limits and completion tracking (see `spawn_governor`).
@@ -251,6 +284,7 @@ impl Engine {
                 throttling: false,
                 dirty: true,
             })),
+            peer_speeds: Mutex::new(HashMap::new()),
             gov: Arc::new(Mutex::new(Governor {
                 queue_file: data_dir.join("queue.json"),
                 ..Default::default()
@@ -608,6 +642,106 @@ impl Engine {
         speeds.retain(|id, _| rows.iter().any(|r| r.id == *id));
         rows.sort_by_key(|r| r.id);
         rows
+    }
+
+    /// Detailed info for the inspector panel.
+    pub fn details(&self, id: usize) -> Option<TorrentDetails> {
+        let t = self.session.get(id.into())?;
+        let stats = t.stats();
+        let included: Option<std::collections::HashSet<usize>> =
+            t.only_files().map(|v| v.into_iter().collect());
+        let (files, piece_length, pieces, web_seeds) = t
+            .with_metadata(|m| {
+                let files = m
+                    .file_infos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| !f.attrs.padding)
+                    .map(|(i, f)| FileDetail {
+                        index: i,
+                        path: f.relative_filename.display().to_string(),
+                        size: f.len,
+                        done: stats.file_progress.get(i).copied().unwrap_or(0),
+                        included: included.as_ref().is_none_or(|s| s.contains(&i)),
+                    })
+                    .collect::<Vec<_>>();
+                let l = m.lengths();
+                let web_seeds = librqbit::web_seed_urls(&m.torrent_bytes).len();
+                (files, l.default_piece_length(), l.total_pieces(), web_seeds)
+            })
+            .ok()?;
+        let now = Instant::now();
+        let (peers, piece_map) = match t.live() {
+            Some(live) => {
+                let mut speeds = lock(&self.peer_speeds);
+                let peers: Vec<PeerDetail> = live
+                    .ui_peers()
+                    .into_iter()
+                    .map(|p| {
+                        let r = speeds.entry((id, p.addr)).or_default().update(
+                            now,
+                            p.fetched_bytes,
+                            p.uploaded_bytes,
+                        );
+                        PeerDetail {
+                            addr: p.addr,
+                            client: p.client.unwrap_or_default(),
+                            utp: p.utp,
+                            down_bps: r.down_bps,
+                            up_bps: r.up_bps,
+                            have: p.have,
+                        }
+                    })
+                    .collect();
+                speeds.retain(|(tid, addr), _| *tid != id || peers.iter().any(|p| p.addr == *addr));
+                (peers, live.ui_piece_map(160))
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let mut trackers: Vec<String> = t.shared().trackers.iter().map(|u| u.to_string()).collect();
+        trackers.sort();
+        Some(TorrentDetails {
+            info_hash: t.info_hash().as_string(),
+            save_path: t.output_folder().to_path_buf(),
+            piece_length,
+            pieces,
+            files,
+            peers,
+            trackers,
+            piece_map,
+            web_seeds,
+        })
+    }
+
+    /// Include or skip one file of a torrent.
+    pub fn set_file_included(&self, id: usize, file: usize, include: bool) {
+        let Some(handle) = self.session.get(id.into()) else {
+            return;
+        };
+        let session = self.session.clone();
+        let events = self.events.clone();
+        let repaint = self.repaint.clone();
+        self.rt.spawn(async move {
+            let total = handle.with_metadata(|m| m.file_infos.len()).unwrap_or(0);
+            let mut set: std::collections::HashSet<usize> = handle
+                .only_files()
+                .map(|v| v.into_iter().collect())
+                .unwrap_or_else(|| (0..total).collect());
+            if include {
+                set.insert(file);
+            } else {
+                set.remove(&file);
+            }
+            if set.is_empty() {
+                let _ = events.send(Event::Error("At least one file must stay selected".into()));
+                repaint.request_repaint();
+                return;
+            }
+            if let Err(e) = session.update_only_files(&handle, &set).await {
+                let _ = events.send(Event::Error(format!("Could not change files: {e:#}")));
+                repaint.request_repaint();
+            }
+        });
     }
 
     pub fn pause(&self, id: usize) {

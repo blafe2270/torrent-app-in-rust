@@ -124,7 +124,8 @@ impl Rc4 {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
-            let k = self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            let k =
+                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
             *b ^= k;
         }
     }
@@ -572,7 +573,13 @@ mod tests {
         let br: BoxAsyncReadVectored = Box::new(br.into_vectored_compat());
         let initiator = tokio::spawn(initiate(ar, Box::new(aw), ih, true));
         let responder = tokio::spawn(async move {
-            accept(br, Box::new(bw), &[Id20::new([1u8; 20]), ih], EncryptionPolicy::Enabled).await
+            accept(
+                br,
+                Box::new(bw),
+                &[Id20::new([1u8; 20]), ih],
+                EncryptionPolicy::Enabled,
+            )
+            .await
         });
         let (mut ar, mut aw) = initiator.await.unwrap().unwrap();
         let (mut br, mut bw, got) = match responder.await.unwrap().unwrap() {
@@ -668,7 +675,10 @@ mod tests {
         let mut hs = PROTOCOL_HEADER.to_vec();
         hs.extend_from_slice(&[0u8; 48]);
         aw.write_all(&hs).await.unwrap();
-        match accept(br, Box::new(bw), &[], EncryptionPolicy::Enabled).await.unwrap() {
+        match accept(br, Box::new(bw), &[], EncryptionPolicy::Enabled)
+            .await
+            .unwrap()
+        {
             Accepted::Plain(mut r, _) => {
                 let mut buf = vec![0u8; hs.len()];
                 r.read_exact(&mut buf).await.unwrap();

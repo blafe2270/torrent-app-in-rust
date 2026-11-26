@@ -97,6 +97,7 @@ pub use session::{
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
+pub use torrent_state::web_seed_urls;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState,

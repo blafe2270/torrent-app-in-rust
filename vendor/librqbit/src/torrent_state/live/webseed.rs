@@ -17,9 +17,7 @@ use librqbit_core::lengths::ValidPieceIndex;
 use peer_binary_protocol::Piece;
 use tracing::{debug, debug_span, warn};
 
-use super::{
-    AtomicPeerCounters, TorrentStateLive, TorrentStateLocked, write_received_chunk,
-};
+use super::{AtomicPeerCounters, TorrentStateLive, TorrentStateLocked, write_received_chunk};
 use crate::{
     Error,
     piece_tracker::{AcquireRequest, AcquireResult},
@@ -210,7 +208,12 @@ fn acquire(
 }
 
 /// URL of one file on the mirror, per BEP 19.
-fn file_url(base: &str, name: &str, relative: &std::path::Path, multi_file: bool) -> anyhow::Result<url::Url> {
+fn file_url(
+    base: &str,
+    name: &str,
+    relative: &std::path::Path,
+    multi_file: bool,
+) -> anyhow::Result<url::Url> {
     let mut url = url::Url::parse(base).context("bad web seed URL")?;
     if multi_file || base.ends_with('/') {
         let mut segs = url
@@ -245,6 +248,18 @@ async fn download_piece(
         .map(|n| n.to_string())
         .unwrap_or_default();
     let multi_file = state.metadata.file_infos.len() > 1;
+
+    // Respect the torrent's and the session's download rate limits, block
+    // by block, exactly like peer downloads do.
+    let session = state.shared.session.upgrade();
+    for chunk in state.lengths.iter_chunk_infos(piece) {
+        if let Some(n) = std::num::NonZeroU32::new(chunk.size) {
+            state.ratelimits.prepare_for_download(n).await?;
+            if let Some(s) = &session {
+                s.ratelimits.prepare_for_download(n).await?;
+            }
+        }
+    }
 
     let mut data = Vec::with_capacity(len as usize);
     for fi in state.metadata.file_infos.iter() {
@@ -315,7 +330,10 @@ mod tests {
     #[test]
     fn parses_url_list_forms() {
         let list = b"d8:announce3:foo8:url-listl19:http://a.example/x/6:ftp://19:https://b.example/ye4:infod4:name1:xee";
-        assert_eq!(url_list(list), vec!["http://a.example/x/", "https://b.example/y"]);
+        assert_eq!(
+            url_list(list),
+            vec!["http://a.example/x/", "https://b.example/y"]
+        );
         let single = b"d4:infod4:name1:xe8:url-list16:http://m.ex/a.ise";
         assert_eq!(url_list(single), vec!["http://m.ex/a.is"]);
         assert!(url_list(b"d4:infod4:name1:xee").is_empty());
@@ -325,19 +343,31 @@ mod tests {
     fn builds_bep19_urls() {
         let p = std::path::Path::new("sub/f.bin");
         assert_eq!(
-            file_url("http://h/dir/", "My Torrent", p, true).unwrap().as_str(),
+            file_url("http://h/dir/", "My Torrent", p, true)
+                .unwrap()
+                .as_str(),
             "http://h/dir/My%20Torrent/sub/f.bin"
         );
         assert_eq!(
-            file_url("http://h/file.iso", "file.iso", std::path::Path::new("file.iso"), false)
-                .unwrap()
-                .as_str(),
+            file_url(
+                "http://h/file.iso",
+                "file.iso",
+                std::path::Path::new("file.iso"),
+                false
+            )
+            .unwrap()
+            .as_str(),
             "http://h/file.iso"
         );
         assert_eq!(
-            file_url("http://h/dir/", "file.iso", std::path::Path::new("file.iso"), false)
-                .unwrap()
-                .as_str(),
+            file_url(
+                "http://h/dir/",
+                "file.iso",
+                std::path::Path::new("file.iso"),
+                false
+            )
+            .unwrap()
+            .as_str(),
             "http://h/dir/file.iso"
         );
     }

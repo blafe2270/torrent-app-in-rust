@@ -10,7 +10,7 @@ use eframe::egui::{
     vec2,
 };
 
-use crate::engine::{Engine, Event, PendingTorrent, TorrentRow, TorrentSource};
+use crate::engine::{Engine, Event, PendingTorrent, TorrentDetails, TorrentRow, TorrentSource};
 use crate::format;
 use crate::settings::{self, Settings};
 use crate::theme::{self, Icon, Palette};
@@ -39,6 +39,14 @@ struct ConfirmRemove {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum InspectorTab {
+    Info,
+    Files,
+    Peers,
+    Trackers,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Filter {
     All,
     Downloading,
@@ -52,9 +60,7 @@ impl Filter {
         let ok = row.stats.error.is_none();
         match self {
             Filter::All => true,
-            Filter::Downloading => {
-                ok && (row.queued || (!row.is_paused() && !row.stats.finished))
-            }
+            Filter::Downloading => ok && (row.queued || (!row.is_paused() && !row.stats.finished)),
             Filter::Seeding => ok && !row.is_paused() && row.stats.finished,
             Filter::Paused => row.is_paused() && !row.queued,
             Filter::Errors => !ok,
@@ -74,6 +80,9 @@ pub struct TorrentApp {
     filter: Filter,
     /// Torrent selected in the grid/list (its actions appear in the toolbar).
     selected: Option<usize>,
+    show_inspector: bool,
+    inspector_tab: InspectorTab,
+    details: Option<(usize, Instant, TorrentDetails)>,
     /// Settings the engine was started with (to detect restart-only changes).
     running_settings: Settings,
     /// Editable copy while the settings sheet is open.
@@ -115,6 +124,9 @@ impl TorrentApp {
             history_sampled: None,
             filter: Filter::All,
             selected: None,
+            show_inspector: false,
+            inspector_tab: InspectorTab::Info,
+            details: None,
             settings,
             magnet_input: String::new(),
             add_queue: Vec::new(),
@@ -220,6 +232,11 @@ impl TorrentApp {
                 theme::capsule(ui, |ui| {
                     if theme::capsule_button(ui, Icon::Gear, "Settings", false).clicked() {
                         self.settings_draft = Some(self.settings.clone());
+                    }
+                    if theme::capsule_button(ui, Icon::Info, "Inspector", self.show_inspector)
+                        .clicked()
+                    {
+                        self.show_inspector = !self.show_inspector;
                     }
                 });
 
@@ -430,6 +447,270 @@ impl TorrentApp {
         if Self::sidebar_row(ui, &p, Icon::List, "Activity", None, self.show_log) {
             self.show_log = !self.show_log;
         }
+    }
+
+    // ----------------------------------------------------------- inspector
+
+    fn inspector(&mut self, ui: &mut egui::Ui, rows: &[TorrentRow]) {
+        let p = theme::palette(ui);
+        let Some(row) = self
+            .selected
+            .and_then(|id| rows.iter().find(|r| r.id == id))
+        else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() / 2.0 - 20.0);
+                ui.label(RichText::new("Select a torrent").color(p.secondary));
+            });
+            return;
+        };
+        // Refresh details a few times a second while the panel is open.
+        if self
+            .details
+            .as_ref()
+            .is_none_or(|(id, at, _)| *id != row.id || at.elapsed() >= ROWS_REFRESH_INTERVAL)
+            && let Some(d) = self.engine.details(row.id)
+        {
+            self.details = Some((row.id, Instant::now(), d));
+        }
+        let Some(details) = self.details.take() else {
+            return;
+        };
+        let d = &details.2;
+        let mut keep_details = true;
+
+        // Header: icon, name, status.
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(44.0), Sense::hover());
+            let (color, glyph) = Self::state_style(&p, row);
+            theme::app_icon(ui, rect, color, glyph);
+            ui.vertical(|ui| {
+                ui.add(egui::Label::new(RichText::new(&row.name).strong().size(14.0)).truncate())
+                    .on_hover_text(&row.name);
+                ui.label(
+                    RichText::new(row.status_text())
+                        .size(12.0)
+                        .color(p.secondary),
+                );
+            });
+        });
+        ui.add_space(8.0);
+
+        // Segmented tabs.
+        theme::capsule(ui, |ui| {
+            for (tab, label) in [
+                (InspectorTab::Info, "Info".to_string()),
+                (InspectorTab::Files, format!("Files {}", d.files.len())),
+                (InspectorTab::Peers, format!("Peers {}", d.peers.len())),
+                (InspectorTab::Trackers, "Trackers".to_string()),
+            ] {
+                if ui
+                    .add(
+                        egui::Button::selectable(self.inspector_tab == tab, label)
+                            .corner_radius(13),
+                    )
+                    .clicked()
+                {
+                    self.inspector_tab = tab;
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        let id = row.id;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.inspector_tab {
+                InspectorTab::Info => Self::info_tab(ui, &p, row, d),
+                InspectorTab::Files => {
+                    let mut toggles = Vec::new();
+                    for f in &d.files {
+                        let mut inc = f.included;
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut inc, "").changed() {
+                                toggles.push((f.index, inc));
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format::bytes(f.size))
+                                        .size(11.5)
+                                        .color(p.secondary),
+                                );
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&f.path).size(12.5))
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(&f.path);
+                                });
+                            });
+                        });
+                        let frac = if f.size == 0 {
+                            1.0
+                        } else {
+                            f.done as f32 / f.size as f32
+                        };
+                        let color = if !f.included {
+                            p.tertiary
+                        } else if frac >= 1.0 {
+                            p.green
+                        } else {
+                            p.accent
+                        };
+                        theme::progress_bar(ui, frac, color);
+                        ui.add_space(6.0);
+                    }
+                    for (index, inc) in toggles {
+                        self.engine.set_file_included(id, index, inc);
+                        keep_details = false;
+                    }
+                }
+                InspectorTab::Peers => {
+                    if d.peers.is_empty() {
+                        ui.label(RichText::new("No connected peers").color(p.secondary));
+                    }
+                    let mut peers: Vec<_> = d.peers.iter().collect();
+                    peers.sort_by(|a, b| b.down_bps.total_cmp(&a.down_bps));
+                    for peer in peers {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(peer.addr.to_string()).monospace().size(11.5));
+                            if peer.utp {
+                                ui.label(RichText::new("uTP").size(10.5).color(p.tertiary));
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("{:.0}%", peer.have * 100.0))
+                                        .size(11.5)
+                                        .color(p.secondary),
+                                );
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            let client = if peer.client.is_empty() {
+                                "Unknown client"
+                            } else {
+                                &peer.client
+                            };
+                            ui.label(RichText::new(client).size(11.5).color(p.secondary));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("↑ {}", format::speed_bps(peer.up_bps)))
+                                        .size(11.5)
+                                        .color(p.green),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "↓ {}",
+                                        format::speed_bps(peer.down_bps)
+                                    ))
+                                    .size(11.5)
+                                    .color(p.accent),
+                                );
+                            });
+                        });
+                        separator(ui, &p);
+                    }
+                }
+                InspectorTab::Trackers => {
+                    for t in &d.trackers {
+                        ui.add(
+                            egui::Label::new(RichText::new(t).monospace().size(11.5)).truncate(),
+                        )
+                        .on_hover_text(t);
+                    }
+                    if d.trackers.is_empty() {
+                        ui.label(
+                            RichText::new("No trackers (DHT and peer exchange only)")
+                                .color(p.secondary),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} web seed{}",
+                            d.web_seeds,
+                            if d.web_seeds == 1 { "" } else { "s" }
+                        ))
+                        .color(p.secondary),
+                    );
+                }
+            });
+        if keep_details {
+            self.details = Some(details);
+        }
+    }
+
+    fn info_tab(ui: &mut egui::Ui, p: &Palette, row: &TorrentRow, d: &TorrentDetails) {
+        // Piece map: which parts of the torrent we have.
+        if !d.piece_map.is_empty() {
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::same(4), p.track);
+            let w = rect.width() / d.piece_map.len() as f32;
+            for (i, f) in d.piece_map.iter().enumerate() {
+                if *f > 0.0 {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + i as f32 * w, rect.top()),
+                        vec2(w + 0.5, rect.height()),
+                    );
+                    painter.rect_filled(r, 0.0, p.accent.gamma_multiply(0.25 + 0.75 * f));
+                }
+            }
+            ui.add_space(8.0);
+        }
+        let ratio = row.stats.uploaded_bytes as f64 / row.stats.total_bytes.max(1) as f64;
+        let mut kv = |k: &str, v: String| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(k).size(12.0).color(p.secondary));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(v).size(12.0)).truncate());
+                });
+            });
+        };
+        kv("Size", format::bytes(row.stats.total_bytes));
+        kv(
+            "Downloaded",
+            format!(
+                "{} ({:.1}%)",
+                format::bytes(row.stats.progress_bytes),
+                row.progress() * 100.0
+            ),
+        );
+        kv("Uploaded", format::bytes(row.stats.uploaded_bytes));
+        kv("Ratio", format!("{ratio:.2}"));
+        kv("Download speed", format::speed_bps(row.rates.down_bps));
+        kv("Upload speed", format::speed_bps(row.rates.up_bps));
+        if let Some(eta) = row.eta {
+            kv("Time left", format::duration(eta));
+        }
+        kv("Peers", d.peers.len().to_string());
+        kv(
+            "Pieces",
+            format!(
+                "{} × {}",
+                d.pieces,
+                format::bytes(u64::from(d.piece_length))
+            ),
+        );
+        if d.web_seeds > 0 {
+            kv("Web seeds", d.web_seeds.to_string());
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Saved in").size(12.0).color(p.secondary));
+        ui.horizontal(|ui| {
+            if ui.small_button("Show").clicked() {
+                open_in_file_manager(&d.save_path);
+            }
+            path_label(ui, &d.save_path);
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new("Info hash").size(12.0).color(p.secondary));
+        ui.horizontal(|ui| {
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(d.info_hash.clone());
+            }
+            ui.add(egui::Label::new(RichText::new(&d.info_hash).monospace().size(11.0)).truncate());
+        });
     }
 
     // ---------------------------------------------------------------- list
@@ -786,7 +1067,10 @@ impl TorrentApp {
                         } else {
                             p.text
                         };
-                        ui.label(RichText::new(&last.text).size(12.5).color(color));
+                        ui.add(
+                            egui::Label::new(RichText::new(&last.text).size(12.5).color(color))
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
                     });
             });
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1237,6 +1521,30 @@ impl eframe::App for TorrentApp {
                         self.sidebar(ui, &rows);
                     });
             });
+
+        if self.show_inspector {
+            egui::Panel::right("inspector")
+                .exact_size(320.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin {
+                    left: 0,
+                    right: 8,
+                    top: 8,
+                    bottom: 8,
+                }))
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(p.sidebar)
+                        .corner_radius(CornerRadius::same(14))
+                        .stroke(Stroke::new(1.0, p.separator.gamma_multiply(0.7)))
+                        .inner_margin(Margin::symmetric(14, 12))
+                        .show(ui, |ui| {
+                            ui.set_min_size(ui.available_size());
+                            self.inspector(ui, &rows);
+                        });
+                });
+        }
 
         if self.show_log {
             egui::Panel::bottom("log")
