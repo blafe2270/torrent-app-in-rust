@@ -33,6 +33,30 @@ pub struct Settings {
     pub extra_trackers: bool,
     /// Show torrents as an icon grid (true) or a detailed list (false).
     pub grid_view: bool,
+    /// Torrents downloading at once; more wait in the queue (0 = unlimited).
+    /// Fewer simultaneous downloads finish each one sooner.
+    pub max_active_downloads: usize,
+    /// Stop seeding at this upload/size ratio (0 = never).
+    pub seed_ratio_limit: f32,
+    /// Stop seeding after this many minutes (0 = never).
+    pub seed_time_limit_min: u32,
+    /// Desktop notification when a download finishes.
+    pub notify_on_complete: bool,
+    /// MSE/PE protocol encryption.
+    pub encryption: EncryptionMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum EncryptionMode {
+    /// Encrypt when the peer supports it (reaches peers that require it and
+    /// avoids ISP throttling); fall back to plaintext otherwise.
+    #[default]
+    Prefer,
+    /// Only talk to peers over encrypted connections.
+    Require,
+    /// Never encrypt.
+    Off,
 }
 
 impl Default for Settings {
@@ -48,6 +72,11 @@ impl Default for Settings {
             enable_upnp: true,
             extra_trackers: true,
             grid_view: true,
+            max_active_downloads: 3,
+            seed_ratio_limit: 0.0,
+            seed_time_limit_min: 0,
+            notify_on_complete: true,
+            encryption: EncryptionMode::Prefer,
         }
     }
 }
@@ -94,6 +123,7 @@ impl Settings {
             || self.enable_utp != running.enable_utp
             || self.enable_upnp != running.enable_upnp
             || self.extra_trackers != running.extra_trackers
+            || self.encryption != running.encryption
     }
 }
 

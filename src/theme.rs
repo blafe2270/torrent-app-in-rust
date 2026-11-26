@@ -254,6 +254,8 @@ pub enum Icon {
     Grid,
     Warning,
     Check,
+    Clock,
+    Info,
 }
 
 /// Draw an icon centred in `rect`.
@@ -340,6 +342,16 @@ pub fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
                     );
                 }
             }
+        }
+        Icon::Clock => {
+            painter.circle_stroke(c, s * 0.85, stroke);
+            painter.line_segment([c, c + vec2(0.0, -s * 0.5)], stroke);
+            painter.line_segment([c, c + vec2(s * 0.38, s * 0.12)], stroke);
+        }
+        Icon::Info => {
+            painter.circle_stroke(c, s * 0.85, stroke);
+            painter.line_segment([c + vec2(0.0, -s * 0.05), c + vec2(0.0, s * 0.45)], stroke);
+            painter.circle_filled(c + vec2(0.0, -s * 0.38), stroke.width * 0.75, color);
         }
         Icon::Check => {
             painter.add(Shape::line(

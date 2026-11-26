@@ -455,16 +455,18 @@ impl AsyncReadVectored for Rc4Reader {
         vec: &mut [IoSliceMut<'_>],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let n = ready!(Pin::new(&mut this.inner).poll_read_vectored(cx, vec))?;
-        let mut left = n;
-        for slice in vec.iter_mut() {
-            if left == 0 {
-                break;
-            }
-            let take = left.min(slice.len());
-            this.rc4.apply(&mut slice[..take]);
-            left -= take;
-        }
+        // Read into one buffer we keep our own handle on. Some readers (uTP)
+        // advance the caller's IoSliceMut in place, so decrypting `vec` after
+        // the call would touch the wrong bytes.
+        let Some(slice) = vec.iter_mut().find(|s| !s.is_empty()) else {
+            return Poll::Ready(Ok(0));
+        };
+        let buf: &mut [u8] = slice;
+        let n = {
+            let mut one = [IoSliceMut::new(&mut *buf)];
+            ready!(Pin::new(&mut this.inner).poll_read_vectored(cx, &mut one))?
+        };
+        this.rc4.apply(&mut buf[..n]);
         Poll::Ready(Ok(n))
     }
 }
@@ -586,6 +588,74 @@ mod tests {
         let mut buf = [0u8; 9];
         ar.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hi from B");
+    }
+
+    /// A reader that, like uTP, advances the caller's IoSliceMut in place.
+    struct AdvancingReader(std::io::Cursor<Vec<u8>>);
+    impl AsyncRead for AdvancingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let pos = this.0.position() as usize;
+            let data = &this.0.get_ref()[pos..];
+            let n = data.len().min(buf.remaining());
+            buf.put_slice(&data[..n]);
+            this.0.set_position((pos + n) as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncReadVectored for AdvancingReader {
+        fn poll_read_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            mut vec: &mut [IoSliceMut<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let mut written = 0;
+            while let Some(first) = vec.first_mut() {
+                if first.is_empty() {
+                    vec = &mut vec[1..];
+                    continue;
+                }
+                let pos = this.0.position() as usize;
+                let data = &this.0.get_ref()[pos..];
+                if data.is_empty() {
+                    break;
+                }
+                let n = data.len().min(first.len());
+                first[..n].copy_from_slice(&data[..n]);
+                first.advance(n);
+                this.0.set_position((pos + n) as u64);
+                written += n;
+            }
+            Poll::Ready(Ok(written))
+        }
+    }
+
+    #[tokio::test]
+    async fn rc4_reader_with_advancing_inner() {
+        let key = [3u8; 20];
+        let mut plain = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let expected = plain.clone();
+        Rc4::new(&key).apply(&mut plain); // now ciphertext
+        let inner: BoxAsyncReadVectored = Box::new(AdvancingReader(std::io::Cursor::new(plain)));
+        let mut r = Rc4Reader::new(inner, Vec::new(), Rc4::new(&key));
+        let mut out = vec![0u8; expected.len()];
+        let mut got = 0;
+        while got < out.len() {
+            let take = 5.min(out.len() - got);
+            let (a, b) = out[got..].split_at_mut(take);
+            let mut v = [IoSliceMut::new(a), IoSliceMut::new(b)];
+            let n = std::future::poll_fn(|cx| Pin::new(&mut r).poll_read_vectored(cx, &mut v))
+                .await
+                .unwrap();
+            assert!(n > 0);
+            got += n;
+        }
+        assert_eq!(out, expected);
     }
 
     #[tokio::test]

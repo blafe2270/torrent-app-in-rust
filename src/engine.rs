@@ -22,7 +22,8 @@ use librqbit::{
     TorrentStats, TorrentStatsState,
 };
 
-use crate::settings::{PUBLIC_TRACKERS, Settings};
+use crate::settings::{EncryptionMode, PUBLIC_TRACKERS, Settings};
+use librqbit::mse::EncryptionPolicy;
 use crate::speed::{self, Rates, SpeedTracker};
 use crate::upload_policy::{self, WhileDownloading};
 
@@ -67,6 +68,8 @@ pub struct TorrentRow {
     pub rates: Rates,
     /// Time left at the averaged download speed.
     pub eta: Option<Duration>,
+    /// Waiting for a free download slot (see the download queue).
+    pub queued: bool,
 }
 
 impl TorrentRow {
@@ -80,6 +83,9 @@ impl TorrentRow {
     pub fn status_text(&self) -> String {
         if let Some(err) = &self.stats.error {
             return format!("Error: {err}");
+        }
+        if self.queued {
+            return "Queued".into();
         }
         match self.stats.state {
             TorrentStatsState::Initializing { .. } => "Checking…".into(),
@@ -106,6 +112,71 @@ pub struct Engine {
     repaint: egui::Context,
     speeds: Mutex<HashMap<usize, SpeedTracker>>,
     upload: Arc<Mutex<UploadState>>,
+    gov: Arc<Mutex<Governor>>,
+}
+
+/// Queue, seeding limits and completion tracking (see `spawn_governor`).
+#[derive(Default)]
+struct Governor {
+    /// Max torrents downloading at once (0 = unlimited).
+    max_active: usize,
+    /// Pause seeding at this upload/size ratio (0 = never).
+    ratio_limit: f32,
+    /// Pause seeding after this many minutes (0 = never).
+    seed_minutes: u32,
+    notify: bool,
+    /// Torrents waiting for a slot, by id (in add order).
+    queued: std::collections::BTreeSet<usize>,
+    queue_file: PathBuf,
+    /// When we first saw each torrent complete (this session).
+    finished_at: HashMap<usize, Instant>,
+    /// Seen downloading this session (so we notify on completion).
+    was_downloading: std::collections::HashSet<usize>,
+    /// Paused by a seeding limit; not re-paused if the user resumes it.
+    seed_limited: std::collections::HashSet<usize>,
+}
+
+impl Governor {
+    fn save_queue(&self, session: &Session) {
+        let hashes: Vec<String> = session.with_torrents(|it| {
+            it.filter(|(id, _)| self.queued.contains(id))
+                .map(|(_, t)| t.info_hash().as_string())
+                .collect()
+        });
+        if let Ok(json) = serde_json::to_string(&hashes) {
+            let _ = std::fs::write(&self.queue_file, json);
+        }
+    }
+
+    fn load_queue(&mut self, session: &Session) {
+        let hashes: Vec<String> = std::fs::read_to_string(&self.queue_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        self.queued = session.with_torrents(|it| {
+            it.filter(|(_, t)| hashes.contains(&t.info_hash().as_string()))
+                .map(|(id, _)| id)
+                .collect()
+        });
+    }
+}
+
+fn is_paused_state(s: &TorrentStats) -> bool {
+    matches!(
+        s.state,
+        TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true }
+    )
+}
+
+/// Torrents currently using a download slot.
+fn count_active(session: &Session) -> usize {
+    session.with_torrents(|it| {
+        it.filter(|(_, t)| {
+            let s = t.stats();
+            !is_paused_state(&s) && !s.finished && s.error.is_none()
+        })
+        .count()
+    })
 }
 
 /// Inputs and current output of the upload policy (see `upload_policy`).
@@ -180,9 +251,15 @@ impl Engine {
                 throttling: false,
                 dirty: true,
             })),
+            gov: Arc::new(Mutex::new(Governor {
+                queue_file: data_dir.join("queue.json"),
+                ..Default::default()
+            })),
         };
+        lock(&engine.gov).load_queue(&engine.session);
         engine.apply_live_settings(settings);
         engine.spawn_upload_governor();
+        engine.spawn_governor();
         Ok(engine)
     }
 
@@ -197,6 +274,102 @@ impl Engine {
             (settings.upload_limit_kib > 0).then(|| u64::from(settings.upload_limit_kib) * 1000);
         up.mode = settings.upload_policy();
         up.dirty = true;
+        drop(up);
+        let mut g = lock(&self.gov);
+        g.max_active = settings.max_active_downloads;
+        g.ratio_limit = settings.seed_ratio_limit;
+        g.seed_minutes = settings.seed_time_limit_min;
+        g.notify = settings.notify_on_complete;
+    }
+
+    /// Once a second: start queued torrents when slots free up, apply
+    /// seeding limits and announce finished downloads.
+    fn spawn_governor(&self) {
+        let session = Arc::downgrade(&self.session);
+        let gov = self.gov.clone();
+        let events = self.events.clone();
+        let repaint = self.repaint.clone();
+        self.rt.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                let handles: Vec<(usize, Arc<librqbit::ManagedTorrent>)> =
+                    session.with_torrents(|it| it.map(|(id, t)| (id, t.clone())).collect());
+                let now = Instant::now();
+                let mut to_pause = Vec::new();
+                let mut to_start = Vec::new();
+                let mut finished_names = Vec::new();
+                let notify;
+                {
+                    let mut g = lock(&gov);
+                    notify = g.notify;
+                    let before = g.queued.len();
+                    g.queued.retain(|id| handles.iter().any(|(h, _)| h == id));
+                    let mut active = 0usize;
+                    for (id, t) in &handles {
+                        let s = t.stats();
+                        let paused = is_paused_state(&s);
+                        if !paused && !s.finished && s.error.is_none() {
+                            active += 1;
+                            g.was_downloading.insert(*id);
+                        }
+                        if s.finished && s.live.is_some() {
+                            if g.was_downloading.remove(id) {
+                                finished_names
+                                    .push(t.name().unwrap_or_else(|| t.info_hash().as_string()));
+                            }
+                            let since = *g.finished_at.entry(*id).or_insert(now);
+                            if !g.seed_limited.contains(id) {
+                                let ratio = s.uploaded_bytes as f64 / s.total_bytes.max(1) as f64;
+                                let ratio_hit =
+                                    g.ratio_limit > 0.0 && ratio >= f64::from(g.ratio_limit);
+                                let time_hit = g.seed_minutes > 0
+                                    && since.elapsed()
+                                        >= Duration::from_secs(u64::from(g.seed_minutes) * 60);
+                                if ratio_hit || time_hit {
+                                    g.seed_limited.insert(*id);
+                                    to_pause.push(t.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Start queued torrents while there are free slots.
+                    while (g.max_active == 0 || active < g.max_active)
+                        && let Some(id) = g.queued.pop_first()
+                    {
+                        if let Some((_, t)) = handles.iter().find(|(h, _)| *h == id) {
+                            to_start.push(t.clone());
+                            active += 1;
+                        }
+                    }
+                    if g.queued.len() != before || !to_start.is_empty() {
+                        g.save_queue(&session);
+                    }
+                }
+                for t in to_pause {
+                    let _ = session.pause(&t).await;
+                }
+                for t in to_start {
+                    let _ = session.unpause(&t).await;
+                }
+                for name in finished_names {
+                    let _ = events.send(Event::Info(format!("Finished \"{name}\"")));
+                    repaint.request_repaint();
+                    if notify {
+                        tokio::task::spawn_blocking(move || {
+                            let _ = notify_rust::Notification::new()
+                                .summary("Download complete")
+                                .body(&name)
+                                .appname("Rustorrent")
+                                .show();
+                        });
+                    }
+                }
+            }
+        });
     }
 
     /// The upload cap currently in force because something is downloading,
@@ -330,6 +503,7 @@ impl Engine {
     /// [`Self::fetch_metadata`].
     pub fn start_download(&self, pending: PendingTorrent, folder: PathBuf) {
         let max_peers = self.max_peers_per_torrent;
+        let gov = self.gov.clone();
         let session = self.session.clone();
         let events = self.events.clone();
         let repaint = self.repaint.clone();
@@ -348,7 +522,10 @@ impl Engine {
                     .map(|(i, _)| i)
                     .collect::<Vec<_>>()
             });
+            let max_active = lock(&gov).max_active;
+            let queue_it = max_active > 0 && count_active(&session) >= max_active;
             let opts = AddTorrentOptions {
+                paused: queue_it,
                 peer_limit: Some(max_peers),
                 output_folder: Some(output.display().to_string()),
                 only_files,
@@ -360,6 +537,12 @@ impl Engine {
                 .add_torrent(AddTorrent::from_bytes(pending.torrent_bytes), Some(opts))
                 .await
             {
+                Ok(AddTorrentResponse::Added(id, _)) if queue_it => {
+                    let mut g = lock(&gov);
+                    g.queued.insert(id);
+                    g.save_queue(&session);
+                    Event::Info(format!("Queued \"{}\"", pending.name))
+                }
                 Ok(AddTorrentResponse::Added(..)) => {
                     Event::Info(format!("Started \"{}\"", pending.name))
                 }
@@ -383,6 +566,7 @@ impl Engine {
             .session
             .with_torrents(|iter| iter.map(|(id, t)| (id, t.clone())).collect());
 
+        let queued = lock(&self.gov).queued.clone();
         let mut speeds = self.speeds.lock().unwrap_or_else(|e| e.into_inner());
         let mut rows: Vec<TorrentRow> = handles
             .into_iter()
@@ -416,6 +600,7 @@ impl Engine {
                     stats,
                     rates,
                     eta,
+                    queued: queued.contains(&id),
                 }
             })
             .collect();
@@ -426,6 +611,11 @@ impl Engine {
     }
 
     pub fn pause(&self, id: usize) {
+        let mut g = lock(&self.gov);
+        if g.queued.remove(&id) {
+            g.save_queue(&self.session);
+        }
+        drop(g);
         self.with_handle(
             id,
             "pause",
@@ -433,7 +623,13 @@ impl Engine {
         );
     }
 
+    /// Resume (or force-start a queued torrent).
     pub fn resume(&self, id: usize) {
+        let mut g = lock(&self.gov);
+        if g.queued.remove(&id) {
+            g.save_queue(&self.session);
+        }
+        drop(g);
         self.with_handle(id, "resume", |session, h| async move {
             session.unpause(&h).await
         });
@@ -535,6 +731,11 @@ async fn create_session(
             ..Default::default()
         }),
         connect: Some(ConnectionOptions {
+            encryption: match settings.encryption {
+                EncryptionMode::Prefer => EncryptionPolicy::Enabled,
+                EncryptionMode::Require => EncryptionPolicy::Required,
+                EncryptionMode::Off => EncryptionPolicy::Disabled,
+            },
             peer_opts: Some(PeerConnectionOptions {
                 // Benchmarked against libtorrent in a tit-for-tat swarm:
                 // queueing hundreds of requests at slow peers ties pieces up

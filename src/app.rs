@@ -52,9 +52,11 @@ impl Filter {
         let ok = row.stats.error.is_none();
         match self {
             Filter::All => true,
-            Filter::Downloading => ok && !row.is_paused() && !row.stats.finished,
+            Filter::Downloading => {
+                ok && (row.queued || (!row.is_paused() && !row.stats.finished))
+            }
             Filter::Seeding => ok && !row.is_paused() && row.stats.finished,
-            Filter::Paused => row.is_paused(),
+            Filter::Paused => row.is_paused() && !row.queued,
             Filter::Errors => !ok,
         }
     }
@@ -475,6 +477,8 @@ impl TorrentApp {
     fn state_style(p: &Palette, row: &TorrentRow) -> (Color32, Icon) {
         if row.stats.error.is_some() {
             (p.red, Icon::Warning)
+        } else if row.queued {
+            (Color32::from_rgb(94, 92, 230), Icon::Clock)
         } else if row.is_paused() {
             (Color32::from_rgb(142, 142, 147), Icon::Pause)
         } else if row.stats.finished {
@@ -539,6 +543,8 @@ impl TorrentApp {
         }
         let status = if row.stats.error.is_some() {
             "Error".to_string()
+        } else if row.queued {
+            format!("Queued · {:.0}%", row.progress() * 100.0)
         } else if row.is_paused() {
             format!("Paused · {:.0}%", row.progress() * 100.0)
         } else if row.stats.finished {
@@ -1008,9 +1014,90 @@ impl TorrentApp {
                         setting_row(ui, "Extra public trackers", |ui| {
                             theme::toggle(ui, &mut draft.extra_trackers);
                         });
+                        separator(ui, &p);
+                        setting_row(ui, "Encryption", |ui| {
+                            use crate::settings::EncryptionMode as E;
+                            theme::capsule(ui, |ui| {
+                                for (mode, label) in
+                                    [(E::Off, "Off"), (E::Require, "Require"), (E::Prefer, "Prefer")]
+                                {
+                                    let on = draft.encryption == mode;
+                                    if ui
+                                        .add(egui::Button::selectable(on, label).corner_radius(13))
+                                        .clicked()
+                                    {
+                                        draft.encryption = mode;
+                                    }
+                                }
+                            });
+                        });
+                        hint(
+                            ui,
+                            &p,
+                            match draft.encryption {
+                                crate::settings::EncryptionMode::Prefer => "Encrypts traffic when the peer supports it: avoids ISP throttling and reaches peers that require encryption.",
+                                crate::settings::EncryptionMode::Require => "Only encrypted peers: most private, but skips peers without encryption.",
+                                crate::settings::EncryptionMode::Off => "Plain BitTorrent only: can't reach peers that require encryption.",
+                            },
+                        );
                     });
                     ui.add_space(4.0);
                     hint(ui, &p, "Network changes take effect after restarting Rustorrent.");
+
+                    ui.add_space(14.0);
+                    group_title(ui, &p, "QUEUE & SEEDING");
+                    settings_group(ui, &p, |ui| {
+                        setting_row(ui, "Downloads at once", |ui| {
+                            let mut unlimited = draft.max_active_downloads == 0;
+                            if !unlimited {
+                                ui.add(
+                                    egui::DragValue::new(&mut draft.max_active_downloads)
+                                        .range(1..=50),
+                                );
+                            } else {
+                                ui.label(RichText::new("Unlimited").color(p.secondary));
+                            }
+                            let mut limited = !unlimited;
+                            if theme::toggle(ui, &mut limited).changed() {
+                                unlimited = !limited;
+                                draft.max_active_downloads = if unlimited { 0 } else { 3 };
+                            }
+                        });
+                        hint(ui, &p, "Extra torrents wait in a queue. Fewer at once means each finishes sooner.");
+                        separator(ui, &p);
+                        setting_row(ui, "Stop seeding at ratio", |ui| {
+                            let mut on = draft.seed_ratio_limit > 0.0;
+                            if on {
+                                ui.add(
+                                    egui::DragValue::new(&mut draft.seed_ratio_limit)
+                                        .range(0.1..=100.0)
+                                        .speed(0.05)
+                                        .max_decimals(2),
+                                );
+                            }
+                            if theme::toggle(ui, &mut on).changed() {
+                                draft.seed_ratio_limit = if on { 2.0 } else { 0.0 };
+                            }
+                        });
+                        separator(ui, &p);
+                        setting_row(ui, "Stop seeding after", |ui| {
+                            let mut on = draft.seed_time_limit_min > 0;
+                            if on {
+                                ui.add(
+                                    egui::DragValue::new(&mut draft.seed_time_limit_min)
+                                        .range(1..=100_000)
+                                        .suffix(" min"),
+                                );
+                            }
+                            if theme::toggle(ui, &mut on).changed() {
+                                draft.seed_time_limit_min = if on { 60 } else { 0 };
+                            }
+                        });
+                        separator(ui, &p);
+                        setting_row(ui, "Notify when downloads finish", |ui| {
+                            theme::toggle(ui, &mut draft.notify_on_complete);
+                        });
+                    });
                 });
 
             ui.add_space(14.0);
