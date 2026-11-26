@@ -40,10 +40,10 @@ pub fn install_open_url_handler() {
     // v = void, @ = self, : = _cmd, @ = NSApplication, @ = NSArray
     let types = c"v@:@@";
     unsafe {
-        let imp: ffi::IMP = Some(std::mem::transmute::<
+        let imp = std::mem::transmute::<
             unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, *mut NSArray<NSURL>),
             unsafe extern "C-unwind" fn(),
-        >(open_urls));
+        >(open_urls);
         let added = ffi::class_addMethod(
             cls as *const AnyClass as *mut AnyClass,
             sel,

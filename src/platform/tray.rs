@@ -40,20 +40,19 @@ mod imp {
 
         // macOS: monochrome "template" image that adapts to the menu bar.
         #[cfg(target_os = "macos")]
-        let (png, template) = (&include_bytes!("../../assets/tray-template.png")[..], true);
+        let png = &include_bytes!("../../assets/tray-template.png")[..];
         #[cfg(target_os = "windows")]
-        let (png, template) = (&include_bytes!("../../assets/icon-64.png")[..], false);
+        let png = &include_bytes!("../../assets/icon-64.png")[..];
         let icon_data = eframe::icon_data::from_png_bytes(png).ok()?;
         let icon = Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height).ok()?;
 
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Rustorrent");
-        let builder = if template {
-            builder.with_icon_templated(icon)
-        } else {
-            builder.with_icon(icon)
-        };
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icon);
+        #[cfg(target_os = "windows")]
+        let builder = builder.with_icon(icon);
         let tray = builder
             .build()
             .map_err(|e| tracing::warn!("tray icon unavailable: {e}"))
